@@ -1,1 +1,5 @@
-material
+/target
+/report/data
+/report/figures
+/report/implicit-forge.pdf
+/report/__pycache__/

@@ -1,0 +1,40 @@
+{
+  "schema_version": 2,
+  "name": "Axial Coupler",
+  "parameters": ["Collar lift", "Bolt holes", "Bore width"],
+  "tint": [0.94, 0.49, 0.21],
+  "root": {"difference": [
+    {"union": [
+      {"difference": [
+        {"intersection": [
+          {"sphere": [[0, -0.91, 0], 1.86]},
+          {"box": [[0, -0.91, 0], [1.72, 0.24, 1.62]]}
+        ]},
+        {"union": [
+          {"union": [{"sphere": [[1.19, -0.91, 0], {"parameter": 1, "range": [0.16, 0.56]}]}, {"sphere": [[-1.19, -0.91, 0], {"parameter": 1, "range": [0.16, 0.56]}]}]},
+          {"union": [{"sphere": [[0, -0.91, 1.19], {"parameter": 1, "range": [0.16, 0.56]}]}, {"sphere": [[0, -0.91, -1.19], {"parameter": 1, "range": [0.16, 0.56]}]}]}
+        ]}
+      ]},
+      {"union": [
+        {"union": [
+          {"box": [[0, 0.11, 0], [0.41, 1.15, 0.69]]},
+          {"box": [[0, 0.11, 0], [0.69, 1.15, 0.41]]}
+        ]},
+        {"union": [
+          {"difference": [
+            {"intersection": [
+              {"sphere": [[0, {"parameter": 0, "range": [-0.17, 0.98]}, 0], 1.58]},
+              {"box": [[0, {"parameter": 0, "range": [-0.17, 0.98]}, 0], [1.47, 0.18, 1.38]]}
+            ]},
+            {"union": [
+              {"union": [{"sphere": [[1.08, {"parameter": 0, "range": [-0.17, 0.98]}, 0], {"parameter": 1, "range": [0.17, 0.53]}]}, {"sphere": [[-1.08, {"parameter": 0, "range": [-0.17, 0.98]}, 0], {"parameter": 1, "range": [0.17, 0.53]}]}]},
+              {"union": [{"sphere": [[0, {"parameter": 0, "range": [-0.17, 0.98]}, 1.08], {"parameter": 1, "range": [0.17, 0.53]}]}, {"sphere": [[0, {"parameter": 0, "range": [-0.17, 0.98]}, -1.08], {"parameter": 1, "range": [0.17, 0.53]}]}]}
+            ]}
+          ]},
+          {"torus": [[0, {"parameter": 0, "range": [0.01, 1.16]}, 0], 0.68, 0.12]}
+        ]}
+      ]}
+    ]},
+    {"box": [[0, 0, 0], [{"parameter": 2, "range": [0.125, 0.375]}, 2, {"parameter": 2, "range": [0.125, 0.375]}]]}
+  ]}
+}

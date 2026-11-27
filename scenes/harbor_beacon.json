@@ -1,0 +1,82 @@
+{
+  "schema_version": 2,
+  "name": "Harbor Beacon",
+  "parameters": ["Tower waist", "Lantern height", "Balcony span"],
+  "tint": [0.89, 0.71, 0.39],
+  "root": {"union": [
+    {"union": [
+      {"union": [
+        {"difference": [
+          {"difference": [
+            {"box": [[0, -0.22, 0], [1.28, 0.94, 1.28]]},
+            {"torus": [[0, 1.35, 0], {"parameter": 0, "range": [3.9, 4.24]}, 3.52]}
+          ]},
+          {"union": [
+            {"union": [
+              {"box": [[0, -0.84, 0.9], [0.205, 0.34, 0.5]]},
+              {"sphere": [[0, -0.53, 0.82], 0.23]}
+            ]},
+            {"sphere": [[0.33, 0.17, 0.64], 0.175]}
+          ]}
+        ]},
+        {"intersection": [
+          {"sphere": [[0, 0.69, 0], {"parameter": 2, "range": [0.8, 1.16]}]},
+          {"box": [[0, 0.69, 0], [1.2, 0.095, 1.2]]}
+        ]}
+      ]},
+      {"union": [
+        {"union": [
+          {"union": [
+            {"union": [
+              {"box": [[{"parameter": 2, "range": [0.76, 1.12]}, 0.83, {"parameter": 2, "range": [0.0, 0.0]}], [0.033, 0.15, 0.033]]},
+              {"box": [[{"parameter": 2, "range": [-0.76, -1.12]}, 0.83, {"parameter": 2, "range": [0.0, 0.0]}], [0.033, 0.15, 0.033]]}
+            ]},
+            {"union": [
+              {"box": [[{"parameter": 2, "range": [0.0, 0.0]}, 0.83, {"parameter": 2, "range": [0.76, 1.12]}], [0.033, 0.15, 0.033]]},
+              {"box": [[{"parameter": 2, "range": [0.0, 0.0]}, 0.83, {"parameter": 2, "range": [-0.76, -1.12]}], [0.033, 0.15, 0.033]]}
+            ]}
+          ]},
+          {"union": [
+            {"union": [
+              {"box": [[{"parameter": 2, "range": [0.537, 0.792]}, 0.83, {"parameter": 2, "range": [0.537, 0.792]}], [0.033, 0.15, 0.033]]},
+              {"box": [[{"parameter": 2, "range": [-0.537, -0.792]}, 0.83, {"parameter": 2, "range": [0.537, 0.792]}], [0.033, 0.15, 0.033]]}
+            ]},
+            {"union": [
+              {"box": [[{"parameter": 2, "range": [0.537, 0.792]}, 0.83, {"parameter": 2, "range": [-0.537, -0.792]}], [0.033, 0.15, 0.033]]},
+              {"box": [[{"parameter": 2, "range": [-0.537, -0.792]}, 0.83, {"parameter": 2, "range": [-0.537, -0.792]}], [0.033, 0.15, 0.033]]}
+            ]}
+          ]}
+        ]},
+        {"torus": [[0, 0.97, 0], {"parameter": 2, "range": [0.76, 1.12]}, 0.041]}
+      ]}
+    ]},
+    {"union": [
+      {"union": [
+        {"union": [
+          {"union": [
+            {"sphere": [[0, {"parameter": 1, "range": [1.06, 1.29]}, 0], 0.25]},
+            {"box": [[-0.37, {"parameter": 1, "range": [1.02, 1.24]}, -0.37], [0.064, {"parameter": 1, "range": [0.27, 0.49]}, 0.064]]}
+          ]},
+          {"union": [
+            {"box": [[-0.37, {"parameter": 1, "range": [1.02, 1.24]}, 0.37], [0.064, {"parameter": 1, "range": [0.27, 0.49]}, 0.064]]},
+            {"union": [
+              {"box": [[0.37, {"parameter": 1, "range": [1.02, 1.24]}, -0.37], [0.064, {"parameter": 1, "range": [0.27, 0.49]}, 0.064]]},
+              {"box": [[0.37, {"parameter": 1, "range": [1.02, 1.24]}, 0.37], [0.064, {"parameter": 1, "range": [0.27, 0.49]}, 0.064]]}
+            ]}
+          ]}
+        ]},
+        {"intersection": [
+          {"sphere": [[0, {"parameter": 1, "range": [1.13, 1.57]}, 0], 0.664]},
+          {"box": [[0, {"parameter": 1, "range": [1.53, 1.97]}, 0], [0.7, 0.24, 0.7]]}
+        ]}
+      ]},
+      {"union": [
+        {"intersection": [
+          {"sphere": [[0, {"parameter": 1, "range": [1.3, 1.74]}, 0], 0.75]},
+          {"box": [[0, {"parameter": 1, "range": [1.3, 1.74]}, 0], [0.76, 0.06, 0.76]]}
+        ]},
+        {"sphere": [[0, {"parameter": 1, "range": [1.82, 2.26]}, 0], 0.093]}
+      ]}
+    ]}
+  ]}
+}

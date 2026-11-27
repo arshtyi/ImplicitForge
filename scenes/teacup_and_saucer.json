@@ -1,0 +1,40 @@
+{
+  "schema_version": 2,
+  "name": "Teacup and Saucer",
+  "parameters": ["Cup depth", "Handle span", "Saucer span"],
+  "tint": [0.47, 0.8, 0.38],
+  "root": {"union": [
+    {"union": [
+      {"difference": [
+        {"union": [
+          {"intersection": [
+            {"sphere": [[-0.22, 0.53, 0], 1.42]},
+            {"box": [[-0.22, {"parameter": 0, "range": [-0.4, -0.1]}, 0], [1.43, {"parameter": 0, "range": [0.63, 0.93]}, 1.43]]}
+          ]},
+          {"union": [
+            {"torus": [[-0.22, {"parameter": 0, "range": [0.23, 0.83]}, 0], 1.376, 0.064]},
+            {"difference": [
+              {"intersection": [
+                {"sphere": [[{"parameter": 1, "range": [0.98, 1.45]}, -0.03, 0], 0.625]},
+                {"box": [[{"parameter": 1, "range": [0.98, 1.45]}, -0.03, 0], [0.64, 0.64, 0.15]]}
+              ]},
+              {"sphere": [[{"parameter": 1, "range": [0.98, 1.45]}, -0.03, 0], 0.445]}
+            ]}
+          ]}
+        ]},
+        {"sphere": [[-0.22, 0.56, 0], 1.31]}
+      ]},
+      {"intersection": [
+        {"sphere": [[-0.22, -0.94, 0], 0.69]},
+        {"box": [[-0.22, -0.9, 0], [0.71, 0.16, 0.71]]}
+      ]}
+    ]},
+    {"union": [
+      {"intersection": [
+        {"sphere": [[-0.22, -1.16, 0], {"parameter": 2, "range": [1.44, 1.94]}]},
+        {"box": [[-0.22, -1.12, 0], [2, 0.08, 2]]}
+      ]},
+      {"torus": [[-0.22, -1.025, 0], {"parameter": 2, "range": [1.4, 1.9]}, 0.065]}
+    ]}
+  ]}
+}

@@ -1,0 +1,23 @@
+[package]
+name = "implicit-forge"
+version = "0.1.0"
+edition = "2024"
+default-run = "implicit-forge"
+publish = false
+
+[[bin]]
+name = "implicit-forge"
+path = "src/main.rs"
+
+[dependencies]
+ab_glyph = "0.2.32"
+bytemuck = { version = "1", features = ["derive"] }
+fontdb = { version = "0.24", default-features = false, features = ["std", "fs", "fontconfig"] }
+glam = "0.30"
+pollster = "0.4"
+rayon = "1.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+softbuffer = { version = "0.4", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
+wgpu = "27"
+winit = "0.30"
