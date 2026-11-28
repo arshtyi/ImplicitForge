@@ -242,7 +242,7 @@ mod tests {
     use super::*;
     use crate::{
         render::{Camera, cpu},
-        scene::{DEMO_COUNT, Stamp, StampOp, StampShape, demo},
+        scene::{DEMO_COUNT, Stamp, StampAxis, StampOp, StampShape, demo},
     };
 
     #[test]
@@ -258,22 +258,53 @@ mod tests {
         eprintln!("GPU image comparison on {}", gpu.name);
         let gallery = (0..DEMO_COUNT).map(|i| demo(i, [0.5; 3]));
         let stamped = [
-            (StampShape::Box, StampOp::Union),
-            (StampShape::Torus, StampOp::Subtract),
-            (StampShape::Sphere, StampOp::Intersect),
-            (StampShape::Sphere, StampOp::Smooth),
+            (StampShape::Box, StampOp::Union, StampAxis::Z),
+            (StampShape::Torus, StampOp::Subtract, StampAxis::X),
+            (StampShape::Sphere, StampOp::Intersect, StampAxis::Y),
+            (StampShape::Sphere, StampOp::Smooth, StampAxis::Y),
+            (StampShape::Cylinder, StampOp::SmoothSubtract, StampAxis::Z),
+            (StampShape::Cylinder, StampOp::Union, StampAxis::X),
         ]
         .into_iter()
-        .map(|(shape, op)| {
+        .map(|(shape, op, axis)| {
             demo(1, [0.3, 0.7, 0.2]).with_stamp(Stamp {
                 shape,
                 op,
+                axis,
                 center: [0.55, 0.35, 0.58],
                 size: 0.75,
+                half_extents: [0.40, 0.75, 0.28],
+                half_height: 0.32,
+                blend: 0.24,
             })
         });
+        let grouped = demo(0, [0.5; 3]).with_stamps(
+            &[
+                Stamp {
+                    shape: StampShape::Cylinder,
+                    half_height: 0.22,
+                    axis: StampAxis::Z,
+                    ..Stamp::default()
+                },
+                Stamp {
+                    shape: StampShape::Torus,
+                    center: [-0.8, 0.4, 1.2],
+                    axis: StampAxis::X,
+                    ..Stamp::default()
+                },
+                Stamp {
+                    shape: StampShape::Box,
+                    center: [0.9, 0.6, 0.7],
+                    half_extents: [0.2, 0.4, 0.8],
+                    axis: StampAxis::Z,
+                    ..Stamp::default()
+                },
+            ],
+            true,
+        );
         let cases = gallery
             .chain(stamped)
+            .chain([grouped])
             .enumerate()
             .map(|(index, scene)| (scene, [(65, 43), (63, 41), (67, 45)][index % 3]));
         // Hit the longest legal program and the widest legal dispatch without
@@ -308,6 +339,77 @@ mod tests {
                     scene.name,
                     gpu.name,
                     result.len()
+                );
+            }
+        }
+        compare_field_samples(&mut gpu);
+    }
+
+    fn compare_field_samples(gpu: &mut Gpu) {
+        // Exercise the production scene() interpreter directly, including negative
+        // and off-surface distances that a shaded image cannot discriminate.
+        let module = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("distance probes"),
+                source: wgpu::ShaderSource::Wgsl(
+                    concat!(
+                        include_str!("trace.wgsl"),
+                        r#"
+                @compute @workgroup_size(8, 8, 1)
+                fn probe_field(@builtin(global_invocation_id) id: vec3<u32>) {
+                    if any(id.xy >= frame.dims.xy) { return; }
+                    let p = frame.eye.xyz + f32(id.x) * frame.right.xyz + f32(id.y) * frame.up.xyz;
+                    pixels[id.y * frame.dims.x + id.x] = bitcast<u32>(scene(p));
+                }
+            "#
+                    )
+                    .into(),
+                ),
+            });
+        gpu.pipeline = gpu
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("signed distance samples"),
+                layout: None,
+                module: &module,
+                entry_point: Some("probe_field"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        gpu.frame = None; // Recreate bindings for the probe pipeline's inferred layout.
+        for (op, blend) in [
+            (StampOp::Union, 0.0),
+            (StampOp::Smooth, 0.5),
+            (StampOp::SmoothSubtract, 0.0),
+            (StampOp::SmoothSubtract, 0.5),
+        ] {
+            let scene = demo(0, [0.5; 3]).with_stamp(Stamp {
+                op,
+                blend,
+                shape: StampShape::Cylinder,
+                axis: StampAxis::X,
+                size: 0.75,
+                half_height: 0.25,
+                center: [0.5, 0.25, 0.0],
+                ..Stamp::default()
+            });
+            let mut params = Params::new(&scene, Camera::default(), 25, 19);
+            params.eye = [-1.5, -1.0, 0.375, 0.0];
+            params.right = [0.125, 0.0, 0.0, 0.0];
+            params.up = [0.0, 0.125, 0.0, 0.0];
+            let bits = gpu.render(&scene, &params).unwrap();
+            for (i, word) in bits.into_iter().enumerate() {
+                let p = glam::Vec3::new(
+                    -1.5 + (i % 25) as f32 * 0.125,
+                    -1.0 + (i / 25) as f32 * 0.125,
+                    0.375,
+                );
+                let expected = scene.distance::<false, false>(p, &mut 0);
+                let actual = f32::from_bits(word);
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "{op:?} at {p}: GPU {actual}, CPU {expected}"
                 );
             }
         }

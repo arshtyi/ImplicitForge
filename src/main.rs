@@ -1,6 +1,8 @@
+mod stamp_controls;
 mod text;
 mod ui;
 mod ui_worker;
+mod window_latency;
 
 use std::error::Error;
 use std::num::NonZeroU32;
@@ -10,11 +12,11 @@ use std::time::Instant;
 
 use implicit_forge::render::Camera;
 use implicit_forge::scene::{
-    DEMO_COUNT, MAX_INSTRUCTIONS, Scene, Stamp, StampOp, StampShape, demo,
+    DEMO_COUNT, MAX_INSTRUCTIONS, Scene, Stamp, StampAxis, StampOp, StampShape, demo,
 };
 use softbuffer::{Context, Surface};
 use ui::{Editor, Hit, Layout, Panel};
-use ui_worker::{Backend, Command, Event, Image, Job, Schedule, Worker};
+use ui_worker::{Backend, Command, Event, Image, Job, Schedule, Ticket, Worker};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -79,10 +81,7 @@ impl Design {
 
     fn refresh(&mut self, index: usize) {
         if self.dirty {
-            let mut scene = demo(index, self.values);
-            for &stamp in &self.applied {
-                scene = scene.with_stamp(stamp);
-            }
+            let mut scene = demo(index, self.values).with_stamps(&self.applied, true);
             if self.enabled {
                 scene = scene.with_stamp(self.stamp);
             }
@@ -114,7 +113,10 @@ struct App {
     adapter: Adapter,
     want_adapter: bool,
     pruned: bool,
+    heatmap: bool,
     image: Option<Image>,
+    image_ticket: Option<Ticket>,
+    latency: Option<window_latency::Recorder>,
     cursor: Option<(f64, f64)>,
     drag: Option<Drag>,
     trace: bool,
@@ -143,7 +145,10 @@ impl App {
             },
             want_adapter: false,
             pruned: true,
+            heatmap: false,
             image: None,
+            image_ticket: None,
+            latency: window_latency::Recorder::from_env(),
             cursor: None,
             drag: None,
             trace: std::env::var_os("IMPLICITFORGE_TRACE").is_some_and(|v| v == "1"),
@@ -190,6 +195,7 @@ impl App {
         }
         if hard {
             self.image = None;
+            self.image_ticket = None;
         }
         self.redraw();
     }
@@ -220,6 +226,7 @@ impl App {
                 camera: self.camera,
                 target: d.layout.target(),
                 backend: self.backend(),
+                heatmap: self.heatmap,
             }));
             self.redraw();
         }
@@ -261,6 +268,7 @@ impl App {
                 applied: design.applied.len(),
                 can_apply: design.enabled && design.has_room(),
                 backend,
+                heatmap: self.heatmap,
                 adapter: self.adapter.note(),
                 gpu_requested: self.want_adapter,
                 gpu_allowed: !matches!(self.adapter, Adapter::Disabled),
@@ -270,12 +278,26 @@ impl App {
         );
         d.window.pre_present_notify();
         buffer.present()?;
+        if let (Some(recorder), Some(ticket), Some(image)) =
+            (&mut self.latency, self.image_ticket, &self.image)
+        {
+            recorder.presented(
+                Instant::now(),
+                ticket,
+                self.schedule.revision(),
+                image,
+                &design.scene.name,
+                &d.window,
+                l.target(),
+            );
+        }
         Ok(())
     }
 
     fn select(&mut self, index: usize) {
         if self.selected != index {
             self.selected = index;
+            self.active_slider = 0;
             self.drag = None;
             self.camera = Camera::default();
             self.change(true);
@@ -289,10 +311,9 @@ impl App {
 
     fn slider_value(&self) -> f32 {
         let d = &self.designs[self.selected];
-        match (self.editor, self.active_slider) {
-            (Editor::Scene, i) => d.values[i],
-            (Editor::Tool, 3) => (d.stamp.size - 0.15) / 1.35,
-            (Editor::Tool, i) => (d.stamp.center[i] + 2.) / 4.,
+        match self.editor {
+            Editor::Scene => d.values[self.active_slider],
+            editor => editor.field(d.stamp, self.active_slider).fraction(d.stamp),
         }
     }
 
@@ -303,10 +324,11 @@ impl App {
             return;
         }
         let d = &mut self.designs[self.selected];
-        match (self.editor, self.active_slider) {
-            (Editor::Scene, i) => d.values[i] = v,
-            (Editor::Tool, 3) => d.stamp.size = 0.15 + 1.35 * v,
-            (Editor::Tool, i) => d.stamp.center[i] = 4. * v - 2.,
+        match self.editor {
+            Editor::Scene => d.values[self.active_slider] = v,
+            editor => editor
+                .field(d.stamp, self.active_slider)
+                .set(&mut d.stamp, v),
         }
         if self.editor == Editor::Scene || d.enabled {
             self.geometry_changed();
@@ -330,7 +352,8 @@ impl App {
                 d.stamp.shape = match d.stamp.shape {
                     StampShape::Sphere => StampShape::Box,
                     StampShape::Box => StampShape::Torus,
-                    StampShape::Torus => StampShape::Sphere,
+                    StampShape::Torus => StampShape::Cylinder,
+                    StampShape::Cylinder => StampShape::Sphere,
                 }
             }
             Hit::Operation => {
@@ -338,8 +361,16 @@ impl App {
                     StampOp::Union => StampOp::Subtract,
                     StampOp::Subtract => StampOp::Intersect,
                     StampOp::Intersect => StampOp::Smooth,
-                    StampOp::Smooth => StampOp::Union,
+                    StampOp::Smooth => StampOp::SmoothSubtract,
+                    StampOp::SmoothSubtract => StampOp::Union,
                 }
+            }
+            Hit::Axis if d.stamp.shape != StampShape::Sphere => {
+                d.stamp.axis = match d.stamp.axis {
+                    StampAxis::Y => StampAxis::X,
+                    StampAxis::X => StampAxis::Z,
+                    StampAxis::Z => StampAxis::Y,
+                };
             }
             Hit::Apply if d.enabled && d.has_room() => {
                 d.applied.push(d.stamp);
@@ -351,6 +382,7 @@ impl App {
             }
             _ => return,
         }
+        self.active_slider = self.active_slider.min(self.editor.sliders(d.stamp) - 1);
         self.geometry_changed();
     }
 
@@ -402,6 +434,10 @@ impl App {
         if matches!(self.adapter, Adapter::Disabled) || requested == self.want_adapter {
             return;
         }
+        if requested && self.heatmap {
+            self.heatmap = false;
+            self.change(true);
+        }
         self.want_adapter = requested;
         if requested && matches!(self.adapter, Adapter::Untried | Adapter::Failed(_)) {
             self.adapter = Adapter::Probing;
@@ -415,6 +451,12 @@ impl App {
         } else {
             self.redraw();
         }
+    }
+
+    fn toggle_heatmap(&mut self) {
+        self.heatmap = !self.heatmap;
+        self.want_adapter = false;
+        self.change(true);
     }
 
     fn toggle_cpu_mode(&mut self) {
@@ -442,23 +484,24 @@ impl App {
             KeyCode::Minus | KeyCode::NumpadSubtract => self.zoom(-1.),
             KeyCode::BracketLeft => self.parameter(self.slider_value() - 0.05),
             KeyCode::BracketRight => self.parameter(self.slider_value() + 0.05),
+            KeyCode::KeyH if !repeat => self.toggle_heatmap(),
             KeyCode::Tab if !repeat => {
-                let count = if self.editor == Editor::Tool { 4 } else { 3 };
+                let count = self.editor.sliders(self.designs[self.selected].stamp);
                 self.active_slider = (self.active_slider + 1) % count;
                 self.redraw();
             }
-            KeyCode::KeyT if !repeat => self.editor(if self.editor == Editor::Tool {
+            KeyCode::KeyT if !repeat => self.editor(if self.editor != Editor::Scene {
                 Editor::Scene
             } else {
                 Editor::Tool
             }),
-            KeyCode::Space if !repeat && self.editor == Editor::Tool => {
+            KeyCode::Space if !repeat && self.editor != Editor::Scene => {
                 self.tool_action(Hit::EnableStamp)
             }
-            KeyCode::Enter if !repeat && self.editor == Editor::Tool => {
+            KeyCode::Enter if !repeat && self.editor != Editor::Scene => {
                 self.tool_action(Hit::Apply)
             }
-            KeyCode::Backspace if !repeat && self.editor == Editor::Tool => {
+            KeyCode::Backspace if !repeat && self.editor != Editor::Scene => {
                 self.tool_action(Hit::Undo)
             }
             KeyCode::F11 if !repeat => self.fullscreen(),
@@ -488,15 +531,27 @@ impl App {
         let Some(d) = &self.desktop else {
             return;
         };
-        match l.hit(x, y, self.editor, d.own_frame) {
+        match l.hit(
+            x,
+            y,
+            self.editor,
+            d.own_frame,
+            self.designs[self.selected].stamp,
+        ) {
             Some(Hit::View) => self.drag = Some(Drag::Orbit),
             Some(Hit::Scene(index)) => self.select(index),
             Some(Hit::Editor(editor)) => self.editor(editor),
+            Some(Hit::Fields) => self.editor(if self.editor == Editor::Place {
+                Editor::Tool
+            } else {
+                Editor::Place
+            }),
             Some(Hit::Slider(index)) => {
                 self.active_slider = index;
                 self.drag = Some(Drag::Parameter);
                 self.parameter(l.knob(x));
             }
+            Some(Hit::Heatmap) => self.toggle_heatmap(),
             Some(Hit::Mode) => self.toggle_cpu_mode(),
             Some(Hit::Cpu) => self.set_gpu(false),
             Some(Hit::Gpu) => self.set_gpu(true),
@@ -568,6 +623,7 @@ impl ApplicationHandler<Event> for App {
                             );
                         }
                         self.image = Some(image);
+                        self.image_ticket = Some(ticket);
                     }
                     Err(error) => self.adapter_error(error),
                     _ => {}
@@ -582,6 +638,7 @@ impl ApplicationHandler<Event> for App {
     }
 
     fn window_event(&mut self, events: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let dispatch = self.latency.as_ref().map(|_| Instant::now());
         let Some(d) = &mut self.desktop else {
             return;
         };
@@ -614,7 +671,18 @@ impl ApplicationHandler<Event> for App {
             } => {
                 if state == ElementState::Pressed {
                     self.press(l, events);
+                    if matches!(self.drag, Some(Drag::Orbit))
+                        && let (Some(r), Some(t), Some(p)) =
+                            (&mut self.latency, dispatch, self.cursor)
+                    {
+                        r.press(t, self.schedule.revision(), p);
+                    }
                 } else {
+                    if matches!(self.drag, Some(Drag::Orbit))
+                        && let (Some(r), Some(t)) = (&mut self.latency, dispatch)
+                    {
+                        r.release(t, self.schedule.revision());
+                    }
                     self.drag = None;
                 }
             }
@@ -625,6 +693,9 @@ impl ApplicationHandler<Event> for App {
                     (Some(Drag::Orbit), Some((px, py))) if x != px || y != py => {
                         let sensitivity = 0.008 / d.window.scale_factor() as f32;
                         self.orbit((px - x) as f32 * sensitivity, (y - py) as f32 * sensitivity);
+                        if let (Some(r), Some(t)) = (&mut self.latency, dispatch) {
+                            r.motion(t, self.schedule.revision(), (x, y));
+                        }
                     }
                     (Some(Drag::Parameter), _) => self.parameter(l.knob(x)),
                     _ => {}
@@ -632,7 +703,16 @@ impl ApplicationHandler<Event> for App {
             }
             WindowEvent::MouseWheel { delta, .. }
                 if self.cursor.is_some_and(|(x, y)| {
-                    matches!(l.hit(x, y, self.editor, d.own_frame), Some(Hit::View))
+                    matches!(
+                        l.hit(
+                            x,
+                            y,
+                            self.editor,
+                            d.own_frame,
+                            self.designs[self.selected].stamp
+                        ),
+                        Some(Hit::View)
+                    )
                 }) =>
             {
                 self.zoom(match delta {

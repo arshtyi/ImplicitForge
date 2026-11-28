@@ -200,13 +200,94 @@ fn gallery(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn stamp_tree_bench() -> Result<(), Box<dyn Error>> {
+    use implicit_forge::scene::Stamp;
+
+    const COUNT: usize = 64;
+    const FRAMES: usize = 21;
+    let stamps: Vec<_> = (0..COUNT)
+        .map(|i| {
+            let x = (i % 8) as f32 - 3.5;
+            let z = (i / 8) as f32 - 3.5;
+            Stamp {
+                center: [x * 0.85, -1.04, z * 0.85],
+                size: 0.33,
+                ..Stamp::default()
+            }
+        })
+        .collect();
+    let base = demo(0, [0.5; 3]);
+    let mut incremental = base;
+    for stamp in stamps.iter().copied() {
+        incremental = incremental.with_stamp(stamp);
+    }
+    let optimized = demo(0, [0.5; 3]).with_stamps(&stamps, true);
+    let mut gpu = None;
+    let camera = Camera::default();
+    let params = Params::new(&optimized, camera, TARGET.0, TARGET.1);
+    let reference = render::<false>(FullSerial, &incremental, &params, &mut gpu)?.pixels;
+    writeln!(
+        io::stdout(),
+        "# scene=demo0;stamps=64;layout=8x8;spacing=0.85;radius=0.33;camera=default;resolution={}x{};samples={FRAMES};mode=pruned_tiles",
+        TARGET.0,
+        TARGET.1
+    )?;
+    writeln!(
+        io::stdout(),
+        "case,variant,sample,ms,primitive_evals,ray_steps,mae_rgb8,max_rgb8,differing_pixels"
+    )?;
+    for (_, scene) in [("incremental", &incremental), ("regrouped", &optimized)] {
+        render::<false>(PrunedTiles, scene, &params, &mut gpu)?;
+    }
+    let counts = [
+        render::<true>(PrunedTiles, &incremental, &params, &mut gpu)?,
+        render::<true>(PrunedTiles, &optimized, &params, &mut gpu)?,
+    ];
+    let mut times = [Vec::with_capacity(FRAMES), Vec::with_capacity(FRAMES)];
+    for sample in 0..FRAMES {
+        for offset in 0..2 {
+            let index = (sample + offset) % 2;
+            let (variant, scene) = if index == 0 {
+                ("incremental", &incremental)
+            } else {
+                ("regrouped", &optimized)
+            };
+            let start = Instant::now();
+            let frame = render::<false>(PrunedTiles, scene, &params, &mut gpu)?;
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            times[index].push(ms);
+            let (mae, max) = error(&reference, TARGET, &frame.pixels, TARGET);
+            let differing = frame
+                .pixels
+                .iter()
+                .zip(&reference)
+                .filter(|(a, b)| a != b)
+                .count();
+            writeln!(
+                io::stdout(),
+                "stamp64,{variant},{sample},{ms:.6},{},{},{mae:.7},{max},{differing}",
+                counts[index].evals,
+                counts[index].steps
+            )?;
+        }
+    }
+    for (variant, samples) in ["incremental", "regrouped"].into_iter().zip(&mut times) {
+        samples.sort_by(f64::total_cmp);
+        eprintln!("{variant}: p50 {:.3} ms", samples[FRAMES / 2]);
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.as_slice() == ["--stamp-tree"] {
+        return stamp_tree_bench();
+    }
     let cpu_only = match args.as_slice() {
         [] => false,
         [a] if a == "--cpu" => true,
         [a, dir] if a == "--gallery" => return Ok(gallery(Path::new(dir))?),
-        _ => return Err("usage: measure [--cpu | --gallery DIRECTORY]".into()),
+        _ => return Err("usage: measure [--cpu | --gallery DIRECTORY | --stamp-tree]".into()),
     };
     let mut gpu = if cpu_only {
         None

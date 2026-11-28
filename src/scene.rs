@@ -4,6 +4,8 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Vec2, Vec3};
 use serde::Deserialize;
 
+mod stamp_tree;
+
 pub const MAX_INSTRUCTIONS: usize = 255;
 pub const MAX_STACK: usize = 64;
 const MAX_MAGNITUDE: f32 = 1_000_000.0;
@@ -14,6 +16,8 @@ const UNION: u32 = 3;
 const DIFFERENCE: u32 = 4;
 const INTERSECTION: u32 = 5;
 const SMOOTH: u32 = 6;
+const CYLINDER: u32 = 7;
+const SMOOTH_SUBTRACT: u32 = 8;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -35,6 +39,37 @@ impl Instruction {
     fn operator(op: u32, k: f32) -> Self {
         Self::new(op, Vec3::ZERO, Vec3::new(k, 0.0, 0.0))
     }
+
+    fn is_leaf(&self) -> bool {
+        matches!(self.op[0], SPHERE | BOX | TORUS | CYLINDER)
+    }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        if !self
+            .center
+            .iter()
+            .chain(&self.size)
+            .all(|x| x.abs() <= MAX_MAGNITUDE)
+        {
+            return Err("nonfinite or excessive coordinate");
+        }
+        // Boxes encode world half-extents. Only surfaces of revolution use op.y.
+        if self.op[1] != 0 && !(matches!(self.op[0], TORUS | CYLINDER) && self.op[1] <= 2) {
+            return Err("invalid primitive axis");
+        }
+        let dimensions = match self.op[0] {
+            SPHERE => 1,
+            BOX => 3,
+            TORUS | CYLINDER => 2,
+            SMOOTH | SMOOTH_SUBTRACT if self.size[0] < 0.0 => return Err("negative blend width"),
+            UNION | DIFFERENCE | INTERSECTION | SMOOTH | SMOOTH_SUBTRACT => 0,
+            _ => return Err("unknown opcode"),
+        };
+        if self.size[..dimensions].iter().any(|&x| x <= 0.0) {
+            return Err("nonpositive shape dimension");
+        }
+        Ok(())
+    }
 }
 
 /// Validates the storage/stack contract before interpreting or uploading a program.
@@ -44,41 +79,18 @@ pub fn validate_postfix(code: &[Instruction]) -> Result<(), String> {
     }
     let mut depth = 0;
     for (i, ins) in code.iter().enumerate() {
-        if !ins
-            .center
-            .iter()
-            .chain(ins.size.iter())
-            .all(|x| x.abs() <= MAX_MAGNITUDE)
-        {
-            return Err(format!(
-                "nonfinite or excessive coordinate at instruction {i}"
-            ));
-        }
-        match ins.op[0] {
-            op @ (SPHERE | BOX | TORUS) => {
-                let dimensions = match op {
-                    SPHERE => 1,
-                    BOX => 3,
-                    _ => 2,
-                };
-                if ins.size[..dimensions].iter().any(|&x| x <= 0.0) {
-                    return Err(format!("nonpositive shape dimension at instruction {i}"));
-                }
-                depth += 1;
-                if depth > MAX_STACK {
-                    return Err(format!("postfix stack exceeds {MAX_STACK}"));
-                }
+        ins.validate()
+            .map_err(|err| format!("{err} at instruction {i}"))?;
+        if ins.is_leaf() {
+            depth += 1;
+            if depth > MAX_STACK {
+                return Err(format!("postfix stack exceeds {MAX_STACK}"));
             }
-            UNION | DIFFERENCE | INTERSECTION | SMOOTH => {
-                if depth < 2 {
-                    return Err(format!("stack underflow at instruction {i}"));
-                }
-                if ins.op[0] == SMOOTH && ins.size[0] < 0.0 {
-                    return Err("negative blend width".into());
-                }
-                depth -= 1;
+        } else {
+            if depth < 2 {
+                return Err(format!("stack underflow at instruction {i}"));
             }
-            op => return Err(format!("unknown opcode {op} at instruction {i}")),
+            depth -= 1;
         }
     }
     if depth == 1 {
@@ -143,10 +155,12 @@ enum Definition {
     Sphere(Vector, Scalar),
     Box(Vector, Vector),
     Torus(Vector, Scalar, Scalar),
+    Cylinder(Vector, Scalar, Scalar),
     Union(Box<Self>, Box<Self>),
     Difference(Box<Self>, Box<Self>),
     Intersection(Box<Self>, Box<Self>),
     Smooth(Scalar, Box<Self>, Box<Self>),
+    SmoothSubtract(Scalar, Box<Self>, Box<Self>),
 }
 
 impl Definition {
@@ -173,10 +187,16 @@ impl Definition {
                 vector(c, t, false)?,
                 Vec3::new(r.sample(t, |x| x > 0.0)?, s.sample(t, |x| x > 0.0)?, 0.0),
             ),
+            Cylinder(c, r, h) => Instruction::new(
+                CYLINDER,
+                vector(c, t, false)?,
+                Vec3::new(r.sample(t, |x| x > 0.0)?, h.sample(t, |x| x > 0.0)?, 0.0),
+            ),
             Union(a, b) => join(a, b, UNION, 0.0)?,
             Difference(a, b) => join(a, b, DIFFERENCE, 0.0)?,
             Intersection(a, b) => join(a, b, INTERSECTION, 0.0)?,
             Smooth(k, a, b) => join(a, b, SMOOTH, k.sample(t, |x| x >= 0.0)?)?,
+            SmoothSubtract(k, a, b) => join(a, b, SMOOTH_SUBTRACT, k.sample(t, |x| x >= 0.0)?)?,
         };
         if code.len() == MAX_INSTRUCTIONS {
             return Err("scene instruction limit exceeded".into());
@@ -237,6 +257,7 @@ pub enum StampShape {
     Sphere,
     Box,
     Torus,
+    Cylinder,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -246,6 +267,47 @@ pub enum StampOp {
     Subtract,
     Intersect,
     Smooth,
+    SmoothSubtract,
+}
+
+/// World direction of the stamp's local Y axis. Zero preserves legacy Y-axis instructions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(u32)]
+pub enum StampAxis {
+    #[default]
+    Y = 0,
+    X = 1,
+    Z = 2,
+}
+
+impl StampAxis {
+    fn from_lane(lane: u32) -> Self {
+        match lane {
+            0 => Self::Y,
+            1 => Self::X,
+            2 => Self::Z,
+            _ => unreachable!("validated stamp axis"),
+        }
+    }
+
+    // A quarter turn about Z or X exchanges the axis extents. Signs drop out
+    // because all three oriented primitives are mirror-symmetric in local space.
+    fn world_extents(self, local: Vec3) -> Vec3 {
+        match self {
+            Self::Y => local,
+            Self::X => Vec3::new(local.y, local.x, local.z),
+            Self::Z => Vec3::new(local.x, local.z, local.y),
+        }
+    }
+
+    fn radial_height(self, q: Vec3) -> Vec2 {
+        let (plane, height) = match self {
+            Self::Y => (Vec2::new(q.x, q.z), q.y),
+            Self::X => (Vec2::new(q.y, q.z), q.x),
+            Self::Z => (Vec2::new(q.x, q.y), q.z),
+        };
+        Vec2::new(plane.length(), height)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -253,8 +315,13 @@ pub struct Stamp {
     pub shape: StampShape,
     pub op: StampOp,
     pub center: [f32; 3],
-    /// Radius, box half-extent, or outer radius of a horizontal torus.
+    /// Sphere or cylinder radius, or torus outer radius.
     pub size: f32,
+    pub half_extents: [f32; 3],
+    pub half_height: f32,
+    pub axis: StampAxis,
+    /// Smooth operator blend width in world units, independent of dimensions.
+    pub blend: f32,
 }
 
 impl Default for Stamp {
@@ -264,7 +331,44 @@ impl Default for Stamp {
             op: StampOp::Union,
             center: [0.0, 0.25, 1.0],
             size: 0.6,
+            half_extents: [0.6; 3],
+            half_height: 0.6,
+            axis: StampAxis::Y,
+            blend: 0.3,
         }
+    }
+}
+
+impl Stamp {
+    fn instructions(self) -> [Instruction; 2] {
+        let r = self.size;
+        let (op, size) = match self.shape {
+            StampShape::Sphere => (SPHERE, Vec3::X * r),
+            StampShape::Box => (
+                BOX,
+                self.axis.world_extents(Vec3::from_array(self.half_extents)),
+            ),
+            StampShape::Torus => {
+                assert!(r <= MAX_MAGNITUDE, "excessive stamp radius");
+                (TORUS, Vec3::new(0.72 * r, 0.28 * r, 0.0))
+            }
+            StampShape::Cylinder => (CYLINDER, Vec3::new(r, self.half_height, 0.0)),
+        };
+        let mut leaf = Instruction::new(op, Vec3::from_array(self.center), size);
+        if matches!(op, TORUS | CYLINDER) {
+            leaf.op[1] = self.axis as u32;
+        }
+        let (op, width) = match self.op {
+            StampOp::Union => (UNION, 0.0),
+            StampOp::Subtract => (DIFFERENCE, 0.0),
+            StampOp::Intersect => (INTERSECTION, 0.0),
+            StampOp::Smooth => (SMOOTH, self.blend),
+            StampOp::SmoothSubtract => (SMOOTH_SUBTRACT, self.blend),
+        };
+        let join = Instruction::operator(op, width);
+        leaf.validate().expect("valid stamp geometry");
+        join.validate().expect("valid stamp operator");
+        [leaf, join]
     }
 }
 
@@ -273,6 +377,8 @@ enum Shape {
     Sphere(f32),
     Cuboid(Vec3),
     Torus(f32, f32),
+    OrientedTorus(f32, f32, StampAxis),
+    Cylinder(f32, f32, StampAxis),
 }
 
 impl Shape {
@@ -285,6 +391,13 @@ impl Shape {
                 d.max(Vec3::ZERO).length() + d.max_element().min(0.0)
             }
             Self::Torus(r, s) => Vec2::new(Vec2::new(q.x, q.z).length() - r, q.y).length() - s,
+            Self::OrientedTorus(r, s, axis) => {
+                (axis.radial_height(q) - Vec2::new(r, 0.0)).length() - s
+            }
+            Self::Cylinder(r, h, axis) => {
+                let d = axis.radial_height(q).abs() - Vec2::new(r, h);
+                d.max(Vec2::ZERO).length() + d.max_element().min(0.0)
+            }
         }
     }
 }
@@ -382,16 +495,36 @@ enum Node {
     Difference(Id, Id),
     Intersection(Id, Id),
     Smooth(Id, Id, f32),
+    SmoothSubtract(Id, Id, f32),
 }
 
 type Subtree = (Id, Option<Bounds>);
 
 impl Node {
-    fn leaf(op: u32, c: Vec3, s: Vec3) -> (Self, Option<Bounds>) {
-        let (shape, e) = match op {
+    fn leaf(ins: &Instruction) -> (Self, Option<Bounds>) {
+        let c = Vec3::from_slice(&ins.center);
+        let s = Vec3::from_slice(&ins.size);
+        let axis = StampAxis::from_lane(ins.op[1]);
+        let (shape, e) = match ins.op[0] {
             SPHERE => (Shape::Sphere(s.x), Vec3::splat(s.x)),
             BOX => (Shape::Cuboid(s), s),
-            TORUS => (Shape::Torus(s.x, s.y), Vec3::new(s.x + s.y, s.y, s.x + s.y)),
+            TORUS => {
+                // Keep the original horizontal torus (including every lattice leaf)
+                // on its direct field path, without per-query axis dispatch.
+                let shape = if axis == StampAxis::Y {
+                    Shape::Torus(s.x, s.y)
+                } else {
+                    Shape::OrientedTorus(s.x, s.y, axis)
+                };
+                (
+                    shape,
+                    axis.world_extents(Vec3::new(s.x + s.y, s.y, s.x + s.y)),
+                )
+            }
+            CYLINDER => (
+                Shape::Cylinder(s.x, s.y, axis),
+                axis.world_extents(Vec3::new(s.x, s.y, s.x)),
+            ),
             _ => unreachable!(),
         };
         (
@@ -409,6 +542,9 @@ impl Node {
             UNION => (Self::Union(a, b, Visit::plan(a, ab, b, bb)), union_bounds()),
             // max(a,-b) and max(a,b) are both >= a. For intersection either child suffices.
             DIFFERENCE => (Self::Difference(a, b), ab),
+            SMOOTH_SUBTRACT if k == 0.0 => (Self::Difference(a, b), ab),
+            // Polynomial smooth max(a,-b) >= max(a,-b) >= a for every k.
+            SMOOTH_SUBTRACT => (Self::SmoothSubtract(a, b, k), ab),
             INTERSECTION => (Self::Intersection(a, b), ab.or(bb)),
             // A positive blend can expand past both operands. Use the exact fallback.
             SMOOTH => (
@@ -446,8 +582,8 @@ impl Scene {
             let c = Vec3::from_slice(&ins.center);
             let s = Vec3::from_slice(&ins.size);
             scale = scale.max(c.abs().max_element() + s.max_element());
-            let (node, bounds) = if ins.op[0] <= TORUS {
-                Node::leaf(ins.op[0], c, s)
+            let (node, bounds) = if ins.is_leaf() {
+                Node::leaf(ins)
             } else {
                 let right = stack.pop().unwrap();
                 let left = stack.pop().unwrap();
@@ -467,41 +603,31 @@ impl Scene {
         })
     }
 
-    /// Compose `scene op stamp`. Requires two free instructions, a finite center,
-    /// and positive size within the scene ABI limits. Reuses the compiled tree.
+    /// Compose `scene op stamp`. Requires two free instructions and valid stamp
+    /// dimensions, position and blend width. Reuses the compiled tree.
     pub fn with_stamp(mut self, stamp: Stamp) -> Self {
-        let c = Vec3::from_array(stamp.center);
-        let r = stamp.size;
         assert!(
             self.code.len() + 2 <= MAX_INSTRUCTIONS,
             "stamp exceeds instruction limit"
         );
-        assert!(stamp.center.iter().all(|v| v.abs() <= MAX_MAGNITUDE));
-        assert!(r > 0.0 && r <= MAX_MAGNITUDE);
-        let (shape, s) = match stamp.shape {
-            StampShape::Sphere => (SPHERE, Vec3::X * r),
-            StampShape::Box => (BOX, Vec3::splat(r)),
-            StampShape::Torus => {
-                let minor = 0.28 * r;
-                assert!(minor > 0.0, "stamp torus tube underflow");
-                (TORUS, Vec3::new(0.72 * r, minor, 0.0))
-            }
-        };
-        let (op, k) = match stamp.op {
-            StampOp::Union => (UNION, 0.0),
-            StampOp::Subtract => (DIFFERENCE, 0.0),
-            StampOp::Intersect => (INTERSECTION, 0.0),
-            StampOp::Smooth => (SMOOTH, 0.5 * r),
-        };
+        let [primitive, operator] = stamp.instructions();
+        let c = Vec3::from_slice(&primitive.center);
+        let s = Vec3::from_slice(&primitive.size);
         let n = self.nodes.len();
-        let (leaf, bounds) = Node::leaf(shape, c, s);
-        let (root, root_bounds) =
-            Node::join(op, k, ((n - 1) as Id, self.root_bounds), (n as Id, bounds));
+        let (leaf, bounds) = Node::leaf(&primitive);
+        let (root, root_bounds) = Node::join(
+            operator.op[0],
+            operator.size[0],
+            ((n - 1) as Id, self.root_bounds),
+            (n as Id, bounds),
+        );
         self.nodes.extend([leaf, root]);
-        self.code
-            .extend([Instruction::new(shape, c, s), Instruction::operator(op, k)]);
+        self.code.extend([primitive, operator]);
         self.root_bounds = root_bounds;
-        self.scale = self.scale.max(c.abs().max_element() + s.max_element());
+        self.scale = self
+            .scale
+            .max(c.abs().max_element() + s.max_element())
+            .max(operator.size[0]);
         self
     }
 
@@ -572,6 +698,7 @@ impl Scene {
             Node::Difference(a, b) => exact(a, evals).max(-exact(b, evals)),
             Node::Intersection(a, b) => exact(a, evals).max(exact(b, evals)),
             Node::Smooth(a, b, k) => smooth(exact(a, evals), exact(b, evals), k),
+            Node::SmoothSubtract(a, b, k) => -smooth(-exact(a, evals), exact(b, evals), k),
         }
     }
 }

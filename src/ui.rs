@@ -1,5 +1,6 @@
+use crate::stamp_controls::Field;
 use implicit_forge::resample;
-use implicit_forge::scene::{DEMO_COUNT, Stamp, StampOp, StampShape};
+use implicit_forge::scene::{DEMO_COUNT, Stamp, StampAxis, StampOp, StampShape};
 
 use crate::text::{TextRenderer, TextSurface};
 use crate::ui_worker::{Backend, Image};
@@ -59,7 +60,7 @@ impl Layout {
         [w, h].map(|v| (v * shrink).round().max(1.) as u32)
     }
 
-    pub fn hit(self, x: f64, y: f64, editor: Editor, own_frame: bool) -> Option<Hit> {
+    pub fn hit(self, x: f64, y: f64, editor: Editor, own_frame: bool, stamp: Stamp) -> Option<Hit> {
         if !(0.0..self.width as f64).contains(&x) || !(0.0..self.height as f64).contains(&y) {
             return None;
         }
@@ -110,6 +111,7 @@ impl Layout {
             Hit::Cpu,
             Hit::Gpu,
             Hit::Mode,
+            Hit::Heatmap,
             Hit::Editor(Editor::Scene),
             Hit::Editor(Editor::Tool),
         ];
@@ -118,9 +120,11 @@ impl Layout {
             .chain(
                 match editor {
                     Editor::Scene => &[][..],
-                    Editor::Tool => &[
+                    Editor::Tool | Editor::Place => &[
                         Hit::EnableStamp,
                         Hit::Shape,
+                        Hit::Axis,
+                        Hit::Fields,
                         Hit::Operation,
                         Hit::Apply,
                         Hit::Undo,
@@ -137,7 +141,7 @@ impl Layout {
                 })
                     .map(Hit::Scene),
             )
-            .chain((0..editor.sliders()).map(Hit::Slider))
+            .chain((0..editor.sliders(stamp)).map(Hit::Slider))
             .find(|&hit| contains(hit))
     }
 
@@ -152,13 +156,22 @@ impl Layout {
 pub enum Editor {
     Scene,
     Tool,
+    Place,
 }
 
 impl Editor {
-    fn sliders(self) -> usize {
+    pub fn sliders(self, stamp: Stamp) -> usize {
         match self {
-            Self::Scene => 3,
-            Self::Tool => 4,
+            Self::Scene | Self::Place => 3,
+            Self::Tool => Field::dimensions(stamp).len(),
+        }
+    }
+
+    pub fn field(self, stamp: Stamp, index: usize) -> Field {
+        match self {
+            Self::Tool => Field::dimensions(stamp)[index],
+            Self::Place => Field::Center(index),
+            Self::Scene => unreachable!("scene parameters use the preset ranges"),
         }
     }
 }
@@ -177,9 +190,12 @@ pub enum Hit {
     Cpu,
     Gpu,
     Mode,
+    Heatmap,
     EnableStamp,
     Shape,
     Operation,
+    Axis,
+    Fields,
     Apply,
     Undo,
 }
@@ -193,17 +209,20 @@ impl Hit {
         match self {
             Self::Cpu => left(12, 28),
             Self::Gpu => right(12, 28),
-            Self::Mode => row(44, 24),
+            Self::Mode => left(44, 24),
+            Self::Heatmap => right(44, 24),
             Self::Editor(Editor::Scene) => left(106, 26),
-            Self::Editor(Editor::Tool) => right(106, 26),
+            Self::Editor(Editor::Tool | Editor::Place) => right(106, 26),
             Self::Scene(i) => row(139 + i * 22, 21),
-            Self::EnableStamp => row(162, 26),
-            Self::Shape => left(194, 26),
-            Self::Operation => right(194, 26),
+            Self::EnableStamp => left(142, 26),
+            Self::Axis => right(142, 26),
+            Self::Shape => left(174, 26),
+            Self::Operation => right(174, 26),
+            Self::Fields => row(206, 26),
             Self::Slider(i) => row(
                 match editor {
                     Editor::Scene => 351 + i * 38,
-                    Editor::Tool => 249 + i * 38,
+                    Editor::Tool | Editor::Place => 242 + i * 38,
                 },
                 34,
             ),
@@ -231,6 +250,7 @@ pub struct Panel<'a> {
     pub applied: usize,
     pub can_apply: bool,
     pub backend: Backend,
+    pub heatmap: bool,
     pub adapter: &'a str,
     pub gpu_requested: bool,
     pub own_frame: bool,
@@ -421,6 +441,25 @@ pub fn paint(pixels: &mut [u32], l: Layout, font: &mut TextRenderer, panel: Pane
             PAPER,
             &stats,
         );
+        if image.heatmap && l.view_width >= l.px(560) {
+            let x = l.view_width - l.px(315);
+            for (i, (_, color)) in implicit_forge::render::HEAT_BINS.iter().enumerate() {
+                c.rect(
+                    x + l.px(14 * i),
+                    l.bottom + l.px(9),
+                    l.px(14),
+                    l.px(12),
+                    *color,
+                );
+            }
+            c.label(
+                [x + l.px(120), l.bottom + l.px(7)],
+                l.view_width,
+                15,
+                PAPER,
+                "0 - 8192+ calls / pixel",
+            );
+        }
     } else {
         c.rect(
             0,
@@ -458,7 +497,14 @@ pub fn paint(pixels: &mut [u32], l: Layout, font: &mut TextRenderer, panel: Pane
         true,
     );
     c.button(Hit::Gpu, editor, gpu_label, gpu_active, panel.gpu_allowed);
-    c.button(Hit::Mode, editor, panel.backend.label(), false, true);
+    let mode = match panel.backend {
+        Backend::CpuPruned => "Pruned",
+        Backend::CpuBaseline => "Full tree",
+        Backend::Gpu => "GPU / WGSL",
+        Backend::Software => "Soft / WGSL",
+    };
+    c.button(Hit::Mode, editor, mode, false, true);
+    c.button(Hit::Heatmap, editor, "Cost map", panel.heatmap, true);
     let mut rest = panel.adapter;
     for y in [73, 91] {
         let (line, tail) = c
@@ -466,6 +512,23 @@ pub fn paint(pixels: &mut [u32], l: Layout, font: &mut TextRenderer, panel: Pane
             .wrap_line(rest, 16. * l.scale as f32, l.px(TRACK_W) as f32);
         c.panel_text(INSET, y, 16, MUTED, line);
         rest = tail;
+    }
+    if let Some(image) = panel.image.filter(|im| im.heatmap) {
+        c.panel_rect(INSET, 71, TRACK_W, 34, PANEL);
+        c.panel_text(
+            INSET,
+            74,
+            16,
+            MUTED,
+            &format!("{} primitive calls", image.evals),
+        );
+        c.panel_text(
+            INSET,
+            91,
+            15,
+            MUTED,
+            &format!("{} march steps", image.steps),
+        );
     }
     c.button(
         Hit::Editor(Editor::Scene),
@@ -478,7 +541,7 @@ pub fn paint(pixels: &mut [u32], l: Layout, font: &mut TextRenderer, panel: Pane
         Hit::Editor(Editor::Tool),
         editor,
         "Stamp tool",
-        editor == Editor::Tool,
+        editor != Editor::Scene,
         true,
     );
     match editor {
@@ -498,30 +561,40 @@ pub fn paint(pixels: &mut [u32], l: Layout, font: &mut TextRenderer, panel: Pane
                 );
             }
         }
-        Editor::Tool => {
+        Editor::Tool | Editor::Place => {
             let stamp = panel.stamp;
             let enabled = panel.stamp_enabled;
             let shape = match stamp.shape {
                 StampShape::Sphere => "Sphere",
                 StampShape::Box => "Box",
                 StampShape::Torus => "Torus",
+                StampShape::Cylinder => "Cylinder",
             };
             let operation = match stamp.op {
                 StampOp::Union => "Union",
                 StampOp::Subtract => "Subtract",
                 StampOp::Intersect => "Intersect",
+                StampOp::SmoothSubtract => "Smooth cut",
                 StampOp::Smooth => "Smooth",
             };
             c.button(
                 Hit::EnableStamp,
                 editor,
-                if enabled {
-                    "Stamp preview  ·  On"
-                } else {
-                    "Stamp preview  ·  Off"
-                },
+                if enabled { "Preview on" } else { "Preview off" },
                 enabled,
                 true,
+            );
+            let axis = match stamp.axis {
+                StampAxis::X => "Axis X",
+                StampAxis::Y => "Axis Y",
+                StampAxis::Z => "Axis Z",
+            };
+            c.button(
+                Hit::Axis,
+                editor,
+                axis,
+                false,
+                stamp.shape != StampShape::Sphere,
             );
             c.button(Hit::Shape, editor, &format!("{shape}   ›"), false, true);
             c.button(
@@ -531,22 +604,20 @@ pub fn paint(pixels: &mut [u32], l: Layout, font: &mut TextRenderer, panel: Pane
                 false,
                 true,
             );
-            c.panel_text(INSET, 228, CAPTION, MUTED, "Position and size");
-            for (i, name) in ["Center X", "Center Y", "Center Z", "Size"]
-                .into_iter()
-                .enumerate()
-            {
-                let (units, knob) = if i == 3 {
-                    (stamp.size, (stamp.size - 0.15) / 1.35)
-                } else {
-                    let v = stamp.center[i];
-                    (v, (v + 2.) / 4.)
-                };
+            let section = if editor == Editor::Place {
+                "Position   ›"
+            } else {
+                "Dimensions   ›"
+            };
+            c.button(Hit::Fields, editor, section, false, true);
+            for i in 0..editor.sliders(stamp) {
+                let field = editor.field(stamp, i);
+                let units = field.value(stamp);
                 c.slider(
                     editor,
                     i,
-                    name,
-                    knob,
+                    field.label(),
+                    field.fraction(stamp),
                     &format!("{units:.2}"),
                     i == panel.active_slider,
                 );
@@ -585,19 +656,27 @@ mod tests {
     #[test]
     fn pointer_matches_drawn_edges_at_fractional_dpi() {
         for dpi in [1., 1.25, 1.5, 2.] {
-            let l = Layout::new((760. * dpi) as u32, (492. * dpi) as u32, dpi);
-            for editor in [Editor::Scene, Editor::Tool] {
+            let stamp = Stamp {
+                shape: StampShape::Box,
+                op: StampOp::SmoothSubtract,
+                ..Default::default()
+            };
+            for editor in [Editor::Scene, Editor::Tool, Editor::Place] {
+                let l = Layout::new((760. * dpi) as u32, (492. * dpi) as u32, dpi);
                 let mut hits = vec![
                     Hit::Cpu,
                     Hit::Gpu,
                     Hit::Mode,
+                    Hit::Heatmap,
                     Hit::Editor(Editor::Scene),
                     Hit::Editor(Editor::Tool),
                 ];
-                hits.extend((0..editor.sliders()).map(Hit::Slider));
+                hits.extend((0..editor.sliders(stamp)).map(Hit::Slider));
                 match editor {
                     Editor::Scene => hits.extend((0..DEMO_COUNT).map(Hit::Scene)),
-                    Editor::Tool => hits.extend([
+                    Editor::Tool | Editor::Place => hits.extend([
+                        Hit::Axis,
+                        Hit::Fields,
                         Hit::EnableStamp,
                         Hit::Shape,
                         Hit::Operation,
@@ -609,16 +688,28 @@ mod tests {
                     let [x, y, w, h] = hit.bounds(editor);
                     let left = l.view_width + l.px(x);
                     let right = l.view_width + l.px(x + w);
-                    assert_eq!(l.hit(left as f64, l.px(y) as f64, editor, false), Some(hit));
                     assert_eq!(
-                        l.hit((right - 1) as f64, (l.px(y + h) - 1) as f64, editor, false),
+                        l.hit(left as f64, l.px(y) as f64, editor, false, stamp),
                         Some(hit)
                     );
-                    assert_eq!(l.hit(right as f64, l.px(y) as f64, editor, false), None);
+                    assert_eq!(
+                        l.hit(
+                            (right - 1) as f64,
+                            (l.px(y + h) - 1) as f64,
+                            editor,
+                            false,
+                            stamp
+                        ),
+                        Some(hit)
+                    );
+                    assert_eq!(
+                        l.hit(right as f64, l.px(y) as f64, editor, false, stamp),
+                        None
+                    );
                 }
-                assert_eq!(l.hit(1., 1., editor, false), None);
+                assert_eq!(l.hit(1., 1., editor, false, stamp), None);
                 assert_eq!(
-                    l.hit(l.px(24) as f64, l.px(20) as f64, editor, true),
+                    l.hit(l.px(24) as f64, l.px(20) as f64, editor, true, stamp),
                     Some(Hit::Title)
                 );
                 assert_eq!(
@@ -626,12 +717,17 @@ mod tests {
                         (l.view_width - l.px(18)) as f64,
                         l.px(20) as f64,
                         editor,
-                        true
+                        true,
+                        stamp,
                     ),
                     Some(Hit::Close)
                 );
-                assert_eq!(l.hit(1., l.top as f64, editor, false), Some(Hit::View));
+                assert_eq!(
+                    l.hit(1., l.top as f64, editor, false, stamp),
+                    Some(Hit::View)
+                );
             }
+            let l = Layout::new((760. * dpi) as u32, (492. * dpi) as u32, dpi);
             assert_eq!(l.knob((l.view_width + l.px(INSET)) as f64), 0.);
             assert_eq!(l.knob((l.view_width + l.px(INSET + TRACK_W)) as f64), 1.);
         }
@@ -647,6 +743,9 @@ mod tests {
             size: [1, 1],
             stage: crate::ui_worker::Stage::Preview,
             backend: Backend::CpuPruned,
+            heatmap: true,
+            evals: 314,
+            steps: 42,
             elapsed: std::time::Duration::ZERO,
         };
         for (w, h, dpi) in [(1547, 941, 1.25), (760, 492, 1.), (33, 17, 2.), (1, 1, 1.)] {
@@ -671,6 +770,7 @@ mod tests {
                         applied: 0,
                         can_apply: false,
                         backend: image.backend,
+                        heatmap: true,
                         gpu_requested: false,
                         gpu_allowed: false,
                         adapter: "Disabled",

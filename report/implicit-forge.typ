@@ -32,6 +32,11 @@
 #let thin = table.hline(stroke: 0.4pt + luma(175))
 #let frames = csv("data/frames.csv", row-type: dictionary)
 #let run = json("data/run.json")
+#let tree = csv(
+    bytes(read("data/stamp-tree.csv").split("\n").filter(line => not line.starts-with("#")).join("\n")),
+    row-type: dictionary,
+)
+#let window-run = json("data/window.json")
 #let labels = (few: [少量], many: [密集], sparse: [稀疏], chain: [深链], sculpture: [雕塑])
 #let fixtures = ("few", "many", "sparse", "chain")
 #let cases = fixtures + ("sculpture",)
@@ -70,6 +75,8 @@
 
 #name.join(" · ")
 
+// #outline()
+
 = 目标与使用
 
 隐式建模：几何、法线和阴影都取自同一个距离场，无需重建三角网格。
@@ -87,8 +94,9 @@
 == 演示
 
 + 运行 `just run`。按 `1`--`9` 选场景，拖动旋转，滚轮缩放，`R` 复位相机。窗口启动即显示 CPU 画面。
-+ 分别调整镜头直径、相纸伸出长度和取景器高度。切至 Stamp tool，启用预览，选形状与运算，再调位置及大小。Apply 保留这一层，Undo 撤销最近一层。切换预设会保留本次会话中的编辑。
++ 选 `2` 打开联轴器。在 Stamp tool 中开启预览，选择 Cylinder、Axis Z 和 Subtract，设置半径、高度与中心。在同一位置改选 Smooth cut，调节 Blend width 可改变孔缘。Apply 保留这一层，Undo 撤销最近一层。
 + `B` 在 CPU 全树和剪枝之间切换，`G` 或面板按钮选择计算设备。观察同一轮廓、孔壁阴影和底部帧耗时。
++ 点击 Cost map 或按 `H` 进入 CPU 图元求值热力图。保持相机静止，在 Target 阶段按 `B` 比较全树与剪枝的查询量。
 
 = 原理
 
@@ -105,7 +113,8 @@
         thin, [球，半径 $r$],
         $norm(q)-r$, [盒，半边长 $b$],
         [$u=abs(q)-b$，$d=norm(max(u, 0))+min(max(u_x, u_y, u_z), 0)$], [圆环，主半径 $R$、管半径 $r$],
-        [$rho=sqrt(q_x^2+q_z^2)$，$d=sqrt((rho-R)^2+q_y^2)-r$], rule,
+        [$rho=sqrt(q_x^2+q_z^2)$，$d=sqrt((rho-R)^2+q_y^2)-r$], [有限圆柱，半径 $r$、半高 $h$],
+        [$u=(rho-r, abs(q_y)-h)$，$d=norm(max(u, 0))+min(max(u_1, u_2), 0)$], rule,
     ),
     caption: [盒体公式中的绝对值和与零的最大值逐分量计算。],
 )
@@ -115,6 +124,8 @@
 $ h=max(1-abs(a-b)/k, 0), quad d=min(a, b)-k h^2/4 quad (k>0). $
 
 融合宽度 $k=0$ 时直接取硬并集。融合区内梯度是两侧梯度的凸组合；`min`、`max` 和变号也保持 1-Lipschitz 性。组合场的绝对值因而仍可用作到零等值面的保守步长。
+
+圆柱、圆环和非等边盒可将局部 $y$ 轴对齐世界 $x$、$y$ 或 $z$ 轴。对这三类轴对称或镜面对称图元，交换坐标轴即可求精确距离，包围界的半边长也须随轴交换。盒的三个局部尺寸独立可调，圆柱独立控制半径和高度。记平滑并集为 $s(a,b,k)$，平滑减法为 $-s(-a,b,k)$，零宽度退化为 $max(a, -b)$，光滑过渡宽度与印章尺寸独立。
 
 == 球面追踪与着色
 
@@ -158,6 +169,10 @@ JSON 场景定义有序二叉树；可调数值用参数索引和两个端点表
 
 当两支均有界时，沿两盒中心分离最大的轴先查近侧，再用远侧支撑平面与 $m$ 比较。差与交的结果都不小于左操作数，可继承已证明的下界；运算内部仍求两支的真实值。正宽度融合最多额外降低 $k/4$，实现将其边界标为未知。单侧未知时先完整求该侧，两侧未知时全部求值。
 
+== 重组连续并集
+
+用户按顺序应用印章，连续硬并集满足 $min(min(a, b), c)=min(a, min(b, c))$。编译时将每个连续段按印章中心跨度最大的轴取中位数，递归构造空间上相邻的平衡子树，最后与之前的模型做并集。遇差、交或任一平滑操作即结束该段，保持原操作数顺序。撤销仍从输入列表末尾删除一枚印章。CPU 与 WGSL 共用重组后的后缀流。
+
 = 编辑与图像质量
 
 #figure(
@@ -170,6 +185,15 @@ JSON 场景定义有序二叉树；可调数值用参数索引和两个端点表
 )
 
 初始雕塑的开口使观察者可以同时看到外缘、孔壁和内侧小球。在开口前加入球体后，$#run.figures.edit.changed$ 个像素发生变化，既包括球体遮挡的区域，也包括光源可见性变化造成的投影。差集可用同样的手势切开零件。
+
+#figure(
+    grid(
+        columns: (1fr, 1fr),
+        gutter: 6pt,
+        photo("bore-hard.png", "有限圆柱 · 普通减法"), photo("bore-smooth.png", "同一刀具 · 平滑减法"),
+    ),
+    caption: [轴向 Z，中心 $(0,0.91,0)$，半径 $0.26$，全高 $2.4$。右图融合宽度 $0.20$。],
+)
 
 == 拖动与静止使用不同的采样预算
 
@@ -231,6 +255,47 @@ JSON 场景定义有序二叉树；可调数值用参数索引和两个端点表
 
 稀疏组省去 $#dec(100 * (1 - count("sparse", "serial-pruned") / count("sparse", "serial-full")), n: 1)%$ 的图元求值，主射线和阴影仍共走 $#record("sparse", "serial-full").ray_steps$ 步。串行剪枝相对串行全树的 p50 加速比为 $#dec(percentile("sparse", "serial-full") / percentile("sparse", "serial-pruned"))$ 倍。固定剪枝模式，改用 Rayon 后另得 $#dec(percentile("sparse", "serial-pruned") / percentile("sparse", "rayon-pruned"))$ 倍。少量组的剪枝耗时是全树的 $#dec(percentile("few", "serial-pruned") / percentile("few", "serial-full"))$ 倍。
 
+== 实际印章序列与热力图
+
+在默认雕塑上按行依次加入 $8 times 8$ 个球印章（半径 $0.33$，间距 $0.85$）。保持场景、相机、$160 times 96$ 四采样和 Rayon 剪枝一致，仅改变连续并集的结合顺序。两种布局分别预热，交替计时，计数在额外帧取得。以逐项添加的串行全树图像作共同参考。
+
+#figure(
+    table(
+        columns: 5,
+        rule,
+        table.header([*印章布局*], [*p50 / p95（ms）*], [*图元求值*], [*追踪步数*], [*差异像素*]),
+        thin,
+        ..(("incremental", [按序左结合]), ("regrouped", [空间中位数]))
+            .map(((key, label)) => {
+                let rows = tree.filter(r => r.variant == key)
+                let xs = rows.map(r => float(r.ms)).sorted()
+                let q(p) = dec(xs.at(calc.ceil(xs.len() * p / 100) - 1))
+                (
+                    label,
+                    q(50) + " / " + q(95),
+                    rows.first().primitive_evals,
+                    rows.first().ray_steps,
+                    str(calc.max(..rows.map(r => int(r.differing_pixels)))),
+                )
+            })
+            .flatten(),
+        rule,
+    ),
+    caption: [印章树重组消融，计时范围为渲染与主存帧缓冲交付。],
+)
+
+#let calls(key) = int(tree.find(r => r.variant == key).primitive_evals)
+本组的图元调用减少 $#dec(100 * (1 - calls("regrouped") / calls("incremental")), n: 1)%$。空间分组可整体跳过远端的一簇印章；短并集段或掺有其他操作的模型，其收益取决于查询点和子树的分布。表中渲染时间不含编辑后的重新编译开销。
+
+#figure(
+    grid(
+        columns: (1fr, 1fr),
+        gutter: 6pt,
+        photo("heatmap-baseline.png", "CPU 全树"), photo("heatmap-pruned.png", "CPU 剪枝"),
+    ),
+    caption: [同视角的每像素图元调用次数。包含全部子像素的主射线、阴影和法线查询。固定色阶从冷到暖，下界依次为 $0$、$128$、$256$、$512$、$1024$、$2048$、$4096$、$8192$。],
+)
+
 = 后端对照与交互开销
 
 #if is-compute {
@@ -280,6 +345,31 @@ JSON 场景定义有序二叉树；可调数值用参数索引和两个端点表
 )
 
 雕塑预览的 p50 是目标帧的 $#dec(100 * percentile(sculpt, pruned, w: 40) / percentile(sculpt, pruned), n: 1)%$，代价是细孔和高光处误差增大。
+
+== 真实窗口输入延迟
+
+在有 XTEST 的 X11 会话中启动 release CPU 窗口，通过原生指针事件执行六次水平移动后释放。每轮从已稳定的 Target 开始，路径闭合以恢复初始姿态。应用在 winit 事件处理入口和 softbuffer 成功提交之后读取同一单调时钟，按渲染任务版本筛选帧。移动延迟从首次有效移动到第一张与当前姿态匹配的 Preview；释放延迟从松开鼠标到与最终姿态匹配的 Target。后者包含剩余静止等待、细化和呈现提交。
+
+#if window-run.status == "complete" {
+    let ready = window-run.ready
+    [场景 #ready.scene，后端 #ready.backend，#ready.rayon_workers 个 Rayon 工作线程，窗口 #ready.window.map(str).join(" × ")，预览 #ready.preview.map(str).join(" × ")，目标 #ready.target.map(str).join(" × ")。预热 #window-run.warmup 轮，采集 #window-run.trials 轮，每步间隔约 #window-run.step_interval_ms ms，丢失移动事件 #window-run.measured_dropped_motions 个。]
+    figure(
+        table(
+            columns: 4,
+            rule,
+            table.header([*测量区间*], [*有效轮次*], [*p50（ms）*], [*p95（ms）*]),
+            thin,
+            ..(("motion_preview_ms", [首次移动 → 匹配预览]), ("release_target_ms", [释放 → 匹配目标帧]))
+                .map(((key, label)) => {
+                    let s = window-run.summary.at(key)
+                    (label, str(s.n), dec(s.p50), dec(s.p95))
+                })
+                .flatten(),
+            rule,
+        ),
+        caption: [真实窗口实验，最近秩分位数。],
+    )
+} else [当前报告输入未包含完整窗口样本。#window-run.reason]
 
 == 分工
 

@@ -82,6 +82,11 @@ def generate() -> FigureMetrics:
             cwd=REPORT.parent,
             check=True,
         )
+        subprocess.run(
+            cargo + ["--example", "heatmap", "--", tmp], cwd=REPORT.parent, check=True
+        )
+        for name in ("heatmap-baseline", "heatmap-pruned", "bore-hard", "bore-smooth"):
+            save_png(name, W, H, read_frame(tmp / f"{name}.ppm"))
         base = read_frame(tmp / "demo-1.ppm")
         save_png("demo-1", W, H, base)
         for i in range(2, 10):

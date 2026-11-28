@@ -38,6 +38,16 @@ def cpu_model() -> str:
 def collect(figure_metrics: FigureMetrics) -> None:
     data = REPORT / "data"
     data.mkdir(exist_ok=True)
+    # The interactive experiment has its own entrypoint and requires a display.
+    live = data / "window.json"
+    if not live.exists():
+        live.write_text(
+            json.dumps(
+                {"status": "unavailable", "reason": "window_latency.py has not run"}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     cmd = ["cargo", "run", "--locked", "--release", "--bin", "measure"]
     # Stage a complete measurement before replacing the source of the finished tables.
     with TemporaryDirectory(dir=data) as tmp:
@@ -116,6 +126,12 @@ def collect(figure_metrics: FigureMetrics) -> None:
         metadata.write_text(
             json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
+        tree_path = Path(tmp) / "stamp-tree.csv"
+        with tree_path.open("wb") as out:
+            subprocess.run(
+                cmd + ["--", "--stamp-tree"], cwd=ROOT, stdout=out, check=True
+            )
+        tree_path.replace(data / tree_path.name)
         frames.replace(data / frames.name)
         metadata.replace(data / metadata.name)
         print(

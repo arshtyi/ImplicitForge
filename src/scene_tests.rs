@@ -18,6 +18,7 @@ fn check_field(scene: &Scene, point: Vec3, expected: f32) {
     let b = scene.distance::<true, false>(point, &mut 0);
     assert!((a - expected).abs() <= 1e-6, "{point}: {a} vs {expected}");
     assert_eq!(a, b, "{point}: pruned field");
+    assert_eq!(a, postfix(&scene.code, point), "{point}: postfix field");
 }
 
 #[test]
@@ -132,6 +133,8 @@ fn schema_rejects_invalid_endpoints_even_when_not_sampled() {
         json!({"torus":[[0,0,0],1,-1]}),
         json!({"smooth":[[0,-1],root,root]}),
         json!({"sphere":[[0,0],1]}),
+        json!({"cylinder":[[0,0,0],1,[1,-1]]}),
+        json!({"smooth_subtract":[[0,-1],root,root]}),
         json!({"not_sdf":[]}),
     ] {
         assert!(load_json(&document(bad).to_string(), [0.0; 3]).is_err());
@@ -200,7 +203,14 @@ fn postfix_length_arity_stack_and_dimensions() {
         vec![],
         vec![op],
         vec![leaf, leaf],
-        vec![Instruction::operator(7, 0.0)],
+        vec![Instruction::operator(99, 0.0)],
+        vec![leaf, leaf, Instruction::operator(SMOOTH_SUBTRACT, -0.1)],
+        vec![leaf, Instruction::operator(SMOOTH_SUBTRACT, 0.0)],
+        vec![Instruction::new(CYLINDER, Vec3::ZERO, Vec3::X)],
+        vec![Instruction {
+            op: [CYLINDER, 3, 0, 0],
+            ..Instruction::new(CYLINDER, Vec3::ZERO, Vec3::ONE)
+        }],
         vec![leaf, leaf, Instruction::operator(SMOOTH, -0.1)],
         vec![Instruction::new(SPHERE, Vec3::NAN, Vec3::X)],
         vec![Instruction::new(TORUS, Vec3::ZERO, Vec3::X)],
@@ -220,7 +230,21 @@ fn postfix(code: &[Instruction], p: Vec3) -> f32 {
         let value = match ins.op[0] {
             SPHERE => q.length() - s.x,
             BOX => Shape::Cuboid(s).field(q),
-            TORUS => Shape::Torus(s.x, s.y).field(q),
+            TORUS | CYLINDER => {
+                let (radial, height) = match ins.op[1] {
+                    0 => (Vec2::new(q.x, q.z), q.y),
+                    1 => (Vec2::new(q.y, q.z), q.x),
+                    2 => (Vec2::new(q.x, q.y), q.z),
+                    _ => unreachable!(),
+                };
+                let side = radial.length() - s.x;
+                if ins.op[0] == TORUS {
+                    Vec2::new(side, height).length() - s.y
+                } else {
+                    let cap = height.abs() - s.y;
+                    Vec2::new(side.max(0.0), cap.max(0.0)).length() + side.max(cap).min(0.0)
+                }
+            }
             op => {
                 let (a, b): (f32, f32) = (stack[n - 2], stack[n - 1]);
                 n -= 2;
@@ -229,6 +253,8 @@ fn postfix(code: &[Instruction], p: Vec3) -> f32 {
                     DIFFERENCE => a.max(-b),
                     INTERSECTION => a.max(b),
                     SMOOTH => smooth(a, b, s.x),
+                    SMOOTH_SUBTRACT if s.x == 0.0 => a.max(-b),
+                    SMOOTH_SUBTRACT => -smooth(-a, b, s.x),
                     _ => unreachable!(),
                 }
             }
@@ -300,6 +326,7 @@ fn stamps_append_ordered_boolean_subtrees() {
     let stamp = Stamp {
         center: [1.5, 0.0, 0.0],
         size: 1.0,
+        blend: 0.5,
         ..Stamp::default()
     };
     // At 0.75 both operands have distance -0.25. At 1.5 only the stamp is solid.
@@ -324,7 +351,7 @@ fn stamps_append_ordered_boolean_subtrees() {
     };
     let cube = Stamp {
         shape: StampShape::Box,
-        size: 0.8,
+        half_extents: [0.8; 3],
         center: [0.0; 3],
         ..stamp
     };
@@ -338,6 +365,146 @@ fn stamps_append_ordered_boolean_subtrees() {
         assert_eq!(s.code.len(), 5);
         validate_postfix(&s.code).unwrap();
         assert_eq!(postfix(&s.code, p), s.distance::<true, false>(p, &mut 0));
+    }
+}
+
+#[test]
+fn oriented_stamp_distances_and_world_bounds() {
+    let center = Vec3::new(2.0, -1.0, 3.0);
+    for axis in [StampAxis::X, StampAxis::Y, StampAxis::Z] {
+        // These are right-handed local -> world rotations, including signs.
+        let world = |v: Vec3| match axis {
+            StampAxis::X => Vec3::new(v.y, -v.x, v.z),
+            StampAxis::Y => v,
+            StampAxis::Z => Vec3::new(v.x, -v.z, v.y),
+        };
+        let make = |shape, extents| {
+            let stamp = Stamp {
+                shape,
+                axis,
+                center: center.to_array(),
+                size: 2.0,
+                half_height: 1.0,
+                half_extents: [2.0, 1.0, 3.0],
+                ..Stamp::default()
+            };
+            let [leaf, _] = stamp.instructions();
+            let s =
+                Scene::compile("probe".into(), Default::default(), [1.; 3], vec![leaf]).unwrap();
+            let bounds = s.root_bounds.unwrap();
+            let world_extents = world(extents).abs();
+            assert_eq!(bounds.lo, center - world_extents);
+            assert_eq!(bounds.hi, center + world_extents);
+            s
+        };
+        let cylinder = make(StampShape::Cylinder, Vec3::new(2.0, 1.0, 2.0));
+        for (local, d) in [
+            (Vec3::ZERO, -1.0),
+            (Vec3::new(1.75, 0.0, 0.0), -0.25),
+            (Vec3::new(0.0, -0.75, 0.0), -0.25),
+            (Vec3::new(0.0, 0.5, -2.0), 0.0),
+            (Vec3::new(0.5, -1.0, 0.0), 0.0),
+            (Vec3::new(2.0, 1.0, 0.0), 0.0),
+            (Vec3::new(3.0, 0.0, 4.0), 3.0),
+            (Vec3::new(0.0, 5.0, 1.0), 4.0),
+            (Vec3::new(3.0, -5.0, 4.0), 5.0),
+        ] {
+            check_field(&cylinder, center + world(local), d);
+        }
+        let cuboid = make(StampShape::Box, Vec3::new(2.0, 1.0, 3.0));
+        for (dir, half) in [(Vec3::X, 2.0), (Vec3::Y, 1.0), (Vec3::Z, 3.0)] {
+            check_field(&cuboid, center + world(dir * half), 0.0);
+            check_field(&cuboid, center - world(dir * (half + 0.5)), 0.5);
+        }
+        let torus = make(StampShape::Torus, Vec3::new(2.0, 0.56, 2.0));
+        check_field(&torus, center + world(Vec3::new(1.44, 0.0, 0.0)), -0.56);
+        check_field(&torus, center + world(Vec3::new(0.0, 0.56, 1.44)), 0.0);
+    }
+}
+
+#[test]
+fn independent_blend_and_exact_zero_width() {
+    let base = || scene(ball(0.0, 2.0));
+    for k in [0.0, 0.25, 1.0] {
+        let stamp = Stamp {
+            size: 1.0,
+            center: [0.0; 3],
+            blend: k,
+            ..Stamp::default()
+        };
+        let cut = base().with_stamp(Stamp {
+            op: StampOp::SmoothSubtract,
+            ..stamp
+        });
+        // At x=1.5 both the sphere and negated cutter equal -0.5.
+        check_field(&cut, 1.5 * Vec3::X, -0.5 + k / 4.0);
+        check_field(&cut, Vec3::ZERO, 1.0);
+        check_field(&cut, 3.0 * Vec3::X, 1.0);
+        let union = base().with_stamp(Stamp {
+            op: StampOp::Smooth,
+            center: [2.0, 0.0, 0.0],
+            ..stamp
+        });
+        check_field(&union, 1.5 * Vec3::X, -0.5 - k / 4.0);
+        assert_eq!(union.root_bounds.is_none(), k > 0.0);
+        assert_eq!(cut.root_bounds.unwrap().hi, Vec3::splat(2.0));
+        if k == 0.0 {
+            let hard = base().with_stamp(Stamp {
+                op: StampOp::Subtract,
+                ..stamp
+            });
+            for x in -16..=16 {
+                let p = Vec3::X * (x as f32 * 0.25);
+                assert_eq!(
+                    cut.distance::<true, false>(p, &mut 0),
+                    hard.distance::<true, false>(p, &mut 0)
+                );
+            }
+        }
+    }
+    // A smooth-cut left operand with unknown bounds remains unknown. A hard union
+    // must still visit it at this point outside the original support planes.
+    let puff = json!({"smooth": [1, ball(0.0,1.0), ball(0.0,1.0)]});
+    let cut = json!({"smooth_subtract": [0.5, puff, {"cylinder":[[9,0,0],1,2]}]});
+    check_field(
+        &scene(json!({"union":[ball(1.2,0.02),cut]})),
+        1.2 * Vec3::X,
+        -0.05,
+    );
+}
+
+#[test]
+fn regrouped_oriented_stamps_match_ordered_postfix() {
+    let base = || scene(ball(-4.0, 0.5));
+    let mut stamps = Vec::new();
+    for (i, axis) in [StampAxis::X, StampAxis::Y, StampAxis::Z]
+        .into_iter()
+        .enumerate()
+    {
+        for (j, shape) in [StampShape::Cylinder, StampShape::Box, StampShape::Torus]
+            .into_iter()
+            .enumerate()
+        {
+            stamps.push(Stamp {
+                shape,
+                axis,
+                center: [i as f32 - 1.0, 0.25, j as f32 - 1.0],
+                half_extents: [0.25, 1.25, 0.5],
+                half_height: 1.5,
+                ..Stamp::default()
+            });
+        }
+    }
+    let sequential = stamps.iter().copied().fold(base(), Scene::with_stamp);
+    let grouped = base().with_stamps(&stamps, true);
+    for x in -5..=5 {
+        for z in -5..=5 {
+            for y in [-0.75, 0.25, 1.0] {
+                let p = Vec3::new(x as f32 * 0.45, y, z as f32 * 0.45);
+                let expected = postfix(&sequential.code, p);
+                check_field(&grouped, p, expected);
+            }
+        }
     }
 }
 

@@ -5,11 +5,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use implicit_forge::gpu::Gpu;
-use implicit_forge::render::{Camera, Params, cpu};
+use implicit_forge::render::{Camera, Params, cpu, heatmap};
 use implicit_forge::scene::Scene;
 use winit::event_loop::EventLoopProxy;
 
-const QUIET: Duration = Duration::from_millis(180);
+pub(crate) const QUIET: Duration = Duration::from_millis(180);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
@@ -44,6 +44,12 @@ pub struct Ticket {
     pub stage: Stage,
 }
 
+impl Ticket {
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
 // One running job and one implicit pending snapshot (the current UI state).
 // During a drag, finish the running preview and then sample the newest pose.
 // Fine passes and previews from a different scene/backend can never publish.
@@ -56,6 +62,10 @@ pub struct Schedule {
 }
 
 impl Schedule {
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn new(now: Instant) -> Self {
         Self {
             epoch: 0,
@@ -135,6 +145,9 @@ pub struct Image {
     pub stage: Stage,
     pub backend: Backend,
     pub elapsed: Duration,
+    pub heatmap: bool,
+    pub steps: u64,
+    pub evals: u64,
 }
 
 pub enum Event {
@@ -148,6 +161,7 @@ pub struct Job {
     pub camera: Camera,
     pub target: [u32; 2],
     pub backend: Backend,
+    pub heatmap: bool,
 }
 
 pub enum Command {
@@ -220,30 +234,45 @@ fn run(rx: Receiver<Command>, stop: Arc<AtomicBool>, proxy: EventLoopProxy<Event
                     Stage::Target => params,
                 };
                 let cancel = || stop.load(Ordering::Relaxed);
-                let result = match job.backend {
-                    Backend::Gpu | Backend::Software => {
-                        let gpu = adapter.as_mut().expect("adapter installed before use");
-                        driver_call(|| gpu.render(&job.scene, &params)).map(Some)
+                let result = if job.heatmap {
+                    match job.backend {
+                        Backend::CpuPruned => {
+                            Ok(heatmap::<true>(&job.scene, &params, true, &cancel)
+                                .map(|frame| (frame.pixels, frame.steps, frame.evals)))
+                        }
+                        _ => Ok(heatmap::<false>(&job.scene, &params, true, &cancel)
+                            .map(|frame| (frame.pixels, frame.steps, frame.evals))),
                     }
-                    Backend::CpuPruned => {
-                        Ok(cpu::<true, false>(&job.scene, &params, true, &cancel)
-                            .map(|frame| frame.pixels))
-                    }
-                    Backend::CpuBaseline => {
-                        Ok(cpu::<false, false>(&job.scene, &params, true, &cancel)
-                            .map(|frame| frame.pixels))
+                } else {
+                    match job.backend {
+                        Backend::Gpu | Backend::Software => {
+                            let gpu = adapter.as_mut().expect("adapter installed before use");
+                            driver_call(|| gpu.render(&job.scene, &params))
+                                .map(|pixels| Some((pixels, 0, 0)))
+                        }
+                        Backend::CpuPruned => {
+                            Ok(cpu::<true, false>(&job.scene, &params, true, &cancel)
+                                .map(|frame| (frame.pixels, 0, 0)))
+                        }
+                        Backend::CpuBaseline => {
+                            Ok(cpu::<false, false>(&job.scene, &params, true, &cancel)
+                                .map(|frame| (frame.pixels, 0, 0)))
+                        }
                     }
                 };
                 if result.is_err() {
                     adapter = None;
                 }
-                let result = result.map(|pixels| {
-                    pixels.map(|pixels| Image {
+                let result = result.map(|frame| {
+                    frame.map(|(pixels, steps, evals)| Image {
                         pixels,
                         size,
                         stage: job.ticket.stage,
                         backend: job.backend,
                         elapsed: start.elapsed(),
+                        heatmap: job.heatmap,
+                        steps,
+                        evals,
                     })
                 });
                 if proxy

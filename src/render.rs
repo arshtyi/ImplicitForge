@@ -78,6 +78,27 @@ struct Stats {
     steps: u64,
     evals: u64,
 }
+/// Fixed logarithmic bins for primitive evaluations per pixel.
+/// Values are inclusive lower bounds; the final bin saturates at 8192+.
+pub const HEAT_BINS: [(u64, u32); 8] = [
+    (0, 0x172554),
+    (128, 0x1d4ed8),
+    (256, 0x0891b2),
+    (512, 0x16a34a),
+    (1024, 0x84cc16),
+    (2048, 0xeab308),
+    (4096, 0xf97316),
+    (8192, 0xdc2626),
+];
+
+/// Map a per-pixel primitive-call count to its stable heatmap color.
+pub fn heat_color(evals: u64) -> u32 {
+    HEAT_BINS
+        .iter()
+        .rev()
+        .find(|(bound, _)| evals >= *bound)
+        .map_or(HEAT_BINS[0].1, |(_, color)| *color)
+}
 
 impl Add for Stats {
     type Output = Self;
@@ -96,12 +117,12 @@ enum Surface {
     Floor,
 }
 
-struct Kernel<'a, const PRUNE: bool, const COUNT: bool> {
+struct Kernel<'a, const PRUNE: bool, const COUNT: bool, const HEAT: bool> {
     scene: &'a Scene,
     params: &'a Params,
 }
 
-impl<const PRUNE: bool, const COUNT: bool> Kernel<'_, PRUNE, COUNT> {
+impl<const PRUNE: bool, const COUNT: bool, const HEAT: bool> Kernel<'_, PRUNE, COUNT, HEAT> {
     fn step(&self, p: Vec3, stats: &mut Stats) -> f32 {
         if COUNT {
             stats.steps += 1;
@@ -173,19 +194,26 @@ impl<const PRUNE: bool, const COUNT: bool> Kernel<'_, PRUNE, COUNT> {
         (Vec4::from(p.forward).xyz() + u * Vec4::from(p.right).xyz() + v * Vec4::from(p.up).xyz())
             .normalize()
     }
-
+    /// Shade normally, then replace the result with this pixel's absolute call count.
     fn pixel(&self, x: usize, y: usize, stats: &mut Stats) -> u32 {
         let (x, y) = (x as f32, y as f32);
-        if self.params.dims[3] == 1 {
-            return pack(self.shade(self.ray(x + 0.5, y + 0.5), stats));
-        }
-        let mut sum = Vec3::ZERO;
-        for dy in [0.25, 0.75] {
-            for dx in [0.25, 0.75] {
-                sum += self.shade(self.ray(x + dx, y + dy), stats);
+        let before = stats.evals;
+        let color = if self.params.dims[3] == 1 {
+            pack(self.shade(self.ray(x + 0.5, y + 0.5), stats))
+        } else {
+            let mut sum = Vec3::ZERO;
+            for dy in [0.25, 0.75] {
+                for dx in [0.25, 0.75] {
+                    sum += self.shade(self.ray(x + dx, y + dy), stats);
+                }
             }
+            pack(sum * 0.25)
+        };
+        if HEAT {
+            heat_color(stats.evals - before)
+        } else {
+            color
         }
-        pack(sum * 0.25)
     }
 
     fn shade(&self, dir: Vec3, stats: &mut Stats) -> Vec3 {
@@ -284,13 +312,32 @@ pub fn cpu<const PRUNE: bool, const COUNT: bool>(
     parallel: bool,
     cancel: &(impl Fn() -> bool + Sync),
 ) -> Option<Frame> {
+    render::<PRUNE, COUNT, false>(scene, params, parallel, cancel)
+}
+
+/// Render a primitive-call heatmap with the normal shading rays.
+pub fn heatmap<const PRUNE: bool>(
+    scene: &Scene,
+    params: &Params,
+    parallel: bool,
+    cancel: &(impl Fn() -> bool + Sync),
+) -> Option<Frame> {
+    render::<PRUNE, true, true>(scene, params, parallel, cancel)
+}
+
+fn render<const PRUNE: bool, const COUNT: bool, const HEAT: bool>(
+    scene: &Scene,
+    params: &Params,
+    parallel: bool,
+    cancel: &(impl Fn() -> bool + Sync),
+) -> Option<Frame> {
     if cancel() {
         return None;
     }
     let [w, h, _, _] = params.dims;
     let (w, h) = (w as usize, h as usize);
     let mut pixels = vec![0; w.checked_mul(h)?];
-    let kernel = Kernel::<PRUNE, COUNT> { scene, params };
+    let kernel = Kernel::<PRUNE, COUNT, HEAT> { scene, params };
     let strip = |(i, buf): (usize, &mut [u32])| {
         let height = buf.len() / w;
         let mut it = buf.chunks_mut(w);
@@ -328,7 +375,7 @@ mod tests {
     fn torus_floor_and_open_sky() {
         let scene = fixture(1, 1.0, false);
         let params = Params::new(&scene, Camera::default(), 1, 1);
-        let k = Kernel::<false, true> {
+        let k = Kernel::<false, true, false> {
             scene: &scene,
             params: &params,
         };
@@ -388,7 +435,7 @@ mod tests {
     fn clipped_tiles_match_row_major_reference_and_baseline() {
         let scene = fixture(9, 1.0, false);
         let params = Params::new(&scene, Camera::default(), 35, 19);
-        let k = Kernel::<false, true> {
+        let k = Kernel::<false, true, false> {
             scene: &scene,
             params: &params,
         };
@@ -415,7 +462,7 @@ mod tests {
         let scene = fixture(1, 1.0, false);
         for (w, h) in [(101, 51), (51, 101), (51, 51)] {
             let params = Params::new(&scene, Camera::default(), w, h);
-            let k = Kernel::<false, false> {
+            let k = Kernel::<false, false, false> {
                 scene: &scene,
                 params: &params,
             };
@@ -445,7 +492,7 @@ mod tests {
         for index in 0..DEMO_COUNT {
             let scene = demo(index, [0.5; 3]);
             let params = Params::new(&scene, Camera::default(), w, h);
-            let kernel = Kernel::<true, false> {
+            let kernel = Kernel::<true, false, false> {
                 scene: &scene,
                 params: &params,
             };
@@ -482,6 +529,49 @@ mod tests {
             let pruned = cpu::<true, false>(&scene, &params, true, &|| false).unwrap();
             assert_eq!(pruned.pixels, baseline.pixels);
             assert_eq!((pruned.steps, pruned.evals), (0, 0));
+        }
+    }
+
+    #[test]
+    fn heatmap_counts_match_full_shading_and_use_fixed_scale() {
+        let scene = demo(0, [0.5; 3]);
+        let params = Params::new(&scene, Camera::default(), 24, 16);
+        let counted = cpu::<false, true>(&scene, &params, false, &|| false).unwrap();
+        for parallel in [false, true] {
+            let frame = heatmap::<false>(&scene, &params, parallel, &|| false).unwrap();
+            assert_eq!((frame.steps, frame.evals), (counted.steps, counted.evals));
+            assert_eq!(
+                frame.pixels.len(),
+                (params.dims[0] * params.dims[1]) as usize
+            );
+            assert!(
+                frame
+                    .pixels
+                    .iter()
+                    .all(|color| HEAT_BINS.iter().any(|(_, c)| c == color))
+            );
+        }
+        let pixels = heatmap::<false>(&scene, &params, false, &|| false)
+            .unwrap()
+            .pixels;
+        let max_bound = pixels
+            .iter()
+            .map(|pixel| {
+                HEAT_BINS
+                    .iter()
+                    .rfind(|(_, color)| color == pixel)
+                    .unwrap()
+                    .0
+            })
+            .max()
+            .unwrap();
+        assert!(max_bound <= counted.evals);
+        assert_eq!(heat_color(0), HEAT_BINS[0].1);
+        for (i, (bound, color)) in HEAT_BINS.iter().copied().enumerate() {
+            assert_eq!(heat_color(bound), color);
+            if i + 1 < HEAT_BINS.len() {
+                assert_eq!(heat_color(HEAT_BINS[i + 1].0 - 1), color);
+            }
         }
     }
 
