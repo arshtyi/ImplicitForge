@@ -256,6 +256,24 @@ mod tests {
             Err(error) => panic!("GPU setup or probe failed: {}", error.reasons.join("; ")),
         };
         eprintln!("GPU image comparison on {}", gpu.name);
+        // The first SDF step exceeds FAR, but this ray hits the floor 1.2 units below the eye.
+        let floor_scene = crate::scene::fixture(1, 1.0, false);
+        let mut floor_ray = Params::new(&floor_scene, Camera::default(), 1, 1).single_sample();
+        floor_ray.eye = [-64.0, 0.0, 0.0, 0.0];
+        floor_ray.forward = [0.0, -1.0, 0.0, 0.0];
+        let expected = cpu::<false, false>(&floor_scene, &floor_ray, false, &|| false).unwrap();
+        let actual = gpu.render(&floor_scene, &floor_ray).unwrap();
+        for shift in [0, 8, 16] {
+            let channel = |rgb: u32| (rgb >> shift) & 255u32;
+            assert!(
+                channel(expected.pixels[0]).abs_diff(channel(actual[0])) <= 1,
+                "Floor hit on {}: CPU {:06x}, GPU {:06x}",
+                gpu.name,
+                expected.pixels[0],
+                actual[0]
+            );
+        }
+
         let gallery = (0..DEMO_COUNT).map(|i| demo(i, [0.5; 3]));
         let stamped = [
             (StampShape::Box, StampOp::Union, StampAxis::Z),

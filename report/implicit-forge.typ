@@ -65,7 +65,7 @@
 )
 #let photo(path, caption, pixel: false) = stack(
     dir: ttb,
-    spacing: 2pt,
+    spacing: 5pt,
     image("figures/" + path, width: 100%, scaling: if pixel { "pixelated" } else { "smooth" }, alt: caption),
     align(center, text(size: 8.5pt, caption)),
 )

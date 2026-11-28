@@ -149,6 +149,8 @@ fn trace(rd: vec3<f32>) -> vec3<f32> {
         if plane_t > 32.0 {
             return sky;
         }
+        // The last SDF step can overshoot the floor.
+        t = plane_t;
     }
     let p = eye + rd * t;
     var n = vec3<f32>(0, 1, 0);
