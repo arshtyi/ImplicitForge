@@ -149,6 +149,8 @@ fn trace(rd: vec3<f32>) -> vec3<f32> {
         if plane_t > 32.0 {
             return sky;
         }
+        // The floor point is the exact plane intersection, not the last march step.
+        t = plane_t;
     }
     let p = eye + rd * t;
     var n = vec3<f32>(0, 1, 0);
